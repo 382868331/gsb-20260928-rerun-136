@@ -1,0 +1,74 @@
+package offlinequeue
+
+import (
+	"errors"
+	"sync"
+)
+
+var ErrRemoteUnavailable = errors.New("remote service unavailable")
+var ErrRejectedByService = errors.New("rejected by service")
+var ErrAcknowledgementLost = errors.New("acknowledgement was lost")
+
+type MockService struct {
+	mu       sync.Mutex
+	Offline  bool
+	DropAcks map[string]int
+	Reject   map[string]string
+	applied  map[string]Operation
+	Effects  []Operation
+}
+
+func NewMockService() *MockService {
+	return &MockService{DropAcks: map[string]int{}, Reject: map[string]string{}, applied: map[string]Operation{}}
+}
+
+func (s *MockService) SetOffline(offline bool) { s.Offline = offline }
+
+func (s *MockService) Submit(op Operation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Offline {
+		return ErrRemoteUnavailable
+	}
+	if reason, reject := s.Reject[op.ID]; reject {
+		return errors.Join(ErrRejectedByService, errors.New(reason))
+	}
+	if _, ok := s.applied[op.ID]; !ok {
+		s.applied[op.ID] = op
+		s.Effects = append(s.Effects, op)
+	}
+	if s.DropAcks[op.ID] > 0 {
+		s.DropAcks[op.ID]--
+		if s.DropAcks[op.ID] == 0 {
+			delete(s.DropAcks, op.ID)
+		}
+		return ErrAcknowledgementLost
+	}
+	return nil
+}
+
+func (s *MockService) Cancel(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Offline {
+		return ErrRemoteUnavailable
+	}
+	if _, applied := s.applied[id]; applied {
+		return ErrAlreadyCommitted
+	}
+	return nil
+}
+
+func (s *MockService) EffectCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.Effects)
+}
+
+func (s *MockService) EffectsSnapshot() []Operation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]Operation, len(s.Effects))
+	copy(result, s.Effects)
+	return result
+}
