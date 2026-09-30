@@ -15,8 +15,10 @@ const (
 	StatusSending       Status = "sending"
 	StatusAcknowledged  Status = "acknowledged"
 	StatusRejected      Status = "rejected"
+	StatusConflict      Status = "conflict"
 	StatusBlocked       Status = "blocked"
 	StatusCanceled      Status = "canceled"
+	StatusAbandoned     Status = "abandoned"
 	StatusCancelPending Status = "cancel_pending"
 	StatusCancelDenied  Status = "cancel_denied_committed"
 )
@@ -28,6 +30,9 @@ var (
 	ErrDependencyCycle   = errors.New("dependency cycle")
 	ErrNotCancelable     = errors.New("operation is not waiting to be sent")
 	ErrAlreadyCommitted  = errors.New("operation was already committed by the server")
+	ErrNotRevisable      = errors.New("operation is not waiting for revision or abandon")
+	ErrNotBlocked        = errors.New("operation is not blocked on a dependency")
+	ErrAlreadyUndone     = errors.New("operation was already undone")
 )
 
 type Operation struct {
@@ -35,6 +40,11 @@ type Operation struct {
 	Kind         string `json:"kind"`
 	Payload      string `json:"payload"`
 	DependsOn    string `json:"depends_on,omitempty"`
+	ObjectKey    string `json:"object_key,omitempty"`
+	BaseVersion  int64  `json:"base_version,omitempty"`
+	RevisionOf   string `json:"revision_of,omitempty"`
+	OriginID     string `json:"origin_id,omitempty"`
+	UndoOf       string `json:"undo_of,omitempty"`
 	Status       Status `json:"status"`
 	Attempts     int    `json:"attempts"`
 	RejectReason string `json:"reject_reason,omitempty"`
