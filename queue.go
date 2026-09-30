@@ -28,13 +28,20 @@ var (
 	ErrDependencyCycle   = errors.New("dependency cycle")
 	ErrNotCancelable     = errors.New("operation is not waiting to be sent")
 	ErrAlreadyCommitted  = errors.New("operation was already committed by the server")
+	ErrNotRejected       = errors.New("operation is not in rejected state")
+	ErrNotCommitted      = errors.New("operation was not committed by the server")
+	ErrNotBlocked        = errors.New("operation is not blocked")
 )
 
 type Operation struct {
 	ID           string `json:"id"`
 	Kind         string `json:"kind"`
 	Payload      string `json:"payload"`
+	ObjectID     string `json:"object_id,omitempty"`
+	BaseVersion  int    `json:"base_version,omitempty"`
 	DependsOn    string `json:"depends_on,omitempty"`
+	Revises      string `json:"revises,omitempty"`
+	UndoOf       string `json:"undo_of,omitempty"`
 	Status       Status `json:"status"`
 	Attempts     int    `json:"attempts"`
 	RejectReason string `json:"reject_reason,omitempty"`

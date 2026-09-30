@@ -11,6 +11,10 @@
 - `RequestSubmittedCancel` 单独处理已尝试发送的操作；服务端已经生效时返回 `ErrAlreadyCommitted` 并记录为 `cancel_denied_committed`。
 - 发送前先持久化为 `sending`，重启后可重试。
 - 本地模拟服务按操作 ID 幂等，丢确认后重试不会重复生效。
+- 操作可携带 `ObjectID` 与 `BaseVersion` 前置版本；服务端版本已变化时按业务冲突拒绝，原操作保留意图与拒绝原因。
+- 被拒操作可 `Revise` 生成带新身份与 `Revises` 来源的修订重新提交，或 `Abandon` 放弃；旧记录不被覆盖。
+- 后继操作在前置被拒后保持 `blocked`，必须 `ConfirmSuccessor` 显式确认新前提才会重发，不会自动沿用旧前提。
+- 已生效操作的撤销通过 `UndoCommitted` 生成独立的 `undo:*` 业务操作（记录 `UndoOf` 来源），原操作保持已确认。
 
 运行验证：
 

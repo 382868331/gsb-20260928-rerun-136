@@ -28,23 +28,139 @@ func NewRuntime(clientID string, store *FileStore, remote RemoteService) (*Runti
 }
 
 func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, error) {
+	return r.AddOp(Operation{ID: id, Kind: kind, Payload: payload, DependsOn: dependsOn})
+}
+
+func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
-	if err := r.validateDependency(id, dependsOn); err != nil {
+	if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
 		r.mu.Unlock()
 		return nil, false, err
 	}
-	if existing := r.state.Operations[id]; existing != nil {
+	if existing := r.state.Operations[op.ID]; existing != nil {
 		copied := *existing
 		r.mu.Unlock()
 		return &copied, false, nil
 	}
-	op := &Operation{ID: id, Kind: kind, Payload: payload, DependsOn: dependsOn, Status: StatusPending}
-	r.state.Operations[id] = op
-	r.state.Order = append(r.state.Order, id)
+	op.Status = StatusPending
+	op.RejectReason = ""
+	op.Attempts = 0
+	stored := op
+	r.state.Operations[op.ID] = &stored
+	r.state.Order = append(r.state.Order, op.ID)
 	err := r.store.Save(r.state)
-	copied := *op
+	copied := stored
 	r.mu.Unlock()
 	return &copied, true, err
+}
+
+// Revise creates a new operation with a new identity that carries the
+// rejected operation's intent. The rejected record is kept untouched.
+func (r *Runtime) Revise(rejectedID, newID, newPayload string, newBaseVersion int) (*Operation, error) {
+	r.mu.Lock()
+	old := r.state.Operations[rejectedID]
+	if old == nil {
+		r.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	if old.Status != StatusRejected {
+		r.mu.Unlock()
+		return nil, ErrNotRejected
+	}
+	if r.state.Operations[newID] != nil {
+		r.mu.Unlock()
+		return nil, ErrAlreadyExists
+	}
+	if err := r.validateDependency(newID, old.DependsOn); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	revision := &Operation{
+		ID:          newID,
+		Kind:        old.Kind,
+		Payload:     newPayload,
+		ObjectID:    old.ObjectID,
+		BaseVersion: newBaseVersion,
+		DependsOn:   old.DependsOn,
+		Revises:     rejectedID,
+		Status:      StatusPending,
+	}
+	r.state.Operations[newID] = revision
+	r.state.Order = append(r.state.Order, newID)
+	err := r.store.Save(r.state)
+	copied := *revision
+	r.mu.Unlock()
+	return &copied, err
+}
+
+// Abandon marks a rejected operation as canceled, keeping its record.
+func (r *Runtime) Abandon(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	op := r.state.Operations[id]
+	if op == nil {
+		return ErrNotFound
+	}
+	if op.Status != StatusRejected {
+		return ErrNotRejected
+	}
+	op.Status = StatusCanceled
+	return r.store.Save(r.state)
+}
+
+// ConfirmSuccessor explicitly re-points a blocked successor at a confirmed
+// dependency (typically a revision of its original predecessor). Successors
+// never silently follow a revision without this confirmation.
+func (r *Runtime) ConfirmSuccessor(successorID, newDependsOn string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	op := r.state.Operations[successorID]
+	if op == nil {
+		return ErrNotFound
+	}
+	if op.Status != StatusBlocked {
+		return ErrNotBlocked
+	}
+	if err := r.validateDependency(successorID, newDependsOn); err != nil {
+		return err
+	}
+	op.DependsOn = newDependsOn
+	op.Status = StatusPending
+	op.RejectReason = ""
+	return r.store.Save(r.state)
+}
+
+// UndoCommitted creates a new independent business operation that undoes a
+// committed operation. The original operation stays acknowledged.
+func (r *Runtime) UndoCommitted(committedID string, undo Operation) (*Operation, error) {
+	r.mu.Lock()
+	committed := r.state.Operations[committedID]
+	if committed == nil {
+		r.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	if committed.Status != StatusAcknowledged {
+		r.mu.Unlock()
+		return nil, ErrNotCommitted
+	}
+	if r.state.Operations[undo.ID] != nil {
+		r.mu.Unlock()
+		return nil, ErrAlreadyExists
+	}
+	if err := r.validateDependency(undo.ID, undo.DependsOn); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	undo.Kind = "undo:" + committed.Kind
+	undo.ObjectID = committed.ObjectID
+	undo.UndoOf = committedID
+	undo.Status = StatusPending
+	r.state.Operations[undo.ID] = &undo
+	r.state.Order = append(r.state.Order, undo.ID)
+	err := r.store.Save(r.state)
+	copied := undo
+	r.mu.Unlock()
+	return &copied, err
 }
 
 func (r *Runtime) validateDependency(id, dependsOn string) error {
