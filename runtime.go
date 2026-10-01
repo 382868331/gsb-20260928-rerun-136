@@ -3,6 +3,7 @@ package offlinequeue
 import (
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -33,6 +34,9 @@ func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, er
 
 func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
+	if op.OriginClient == "" {
+		op.OriginClient = r.clientID
+	}
 	if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
 		r.mu.Unlock()
 		return nil, false, err
@@ -167,6 +171,11 @@ func (r *Runtime) validateDependency(id, dependsOn string) error {
 	if dependsOn == "" {
 		return nil
 	}
+	// A qualified prerequisite belongs to another client and may arrive in a
+	// later sync; it cannot be validated against the local store.
+	if strings.Contains(dependsOn, qualifiedSeparator) {
+		return nil
+	}
 	if dependsOn == id {
 		return ErrDependencyCycle
 	}
@@ -237,6 +246,7 @@ func (r *Runtime) RequestSubmittedCancel(id string) error {
 func (r *Runtime) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.refreshBlocked()
 	for {
 		next := r.nextSendable()
 		if next == nil {
@@ -282,6 +292,9 @@ func (r *Runtime) nextSendable() *Operation {
 	sort.Strings(ids)
 	for _, id := range ids {
 		op := r.state.Operations[id]
+		if op.OriginClient != "" && op.OriginClient != r.clientID {
+			continue
+		}
 		if op.Status != StatusPending && op.Status != StatusSending {
 			continue
 		}
@@ -345,4 +358,309 @@ func (r *Runtime) Status(id string) (Operation, bool) {
 		return Operation{}, false
 	}
 	return *op, true
+}
+
+// UnresolvedDependency describes an operation whose prerequisite is not yet
+// acknowledged, so the operation cannot be sent. It powers the user-facing
+// view of dependencies that still need attention after a restart.
+type UnresolvedDependency struct {
+	OperationID      string `json:"operation_id"`
+	OriginClient     string `json:"origin_client"`
+	Status           Status `json:"status"`
+	DependsOn        string `json:"depends_on"`
+	DependencyOf     string `json:"dependency_origin_client"`
+	DependencyStatus Status `json:"dependency_status"`
+	Reason           string `json:"reason"`
+}
+
+// UnresolvedDependencies returns every operation whose prerequisite is absent
+// or not acknowledged. Independent operations are never listed, even while
+// other groups are blocked.
+func (r *Runtime) UnresolvedDependencies() []UnresolvedDependency {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := append([]string(nil), r.state.Order...)
+	sort.Strings(ids)
+	var result []UnresolvedDependency
+	for _, id := range ids {
+		op := r.state.Operations[id]
+		if op == nil || op.DependsOn == "" {
+			continue
+		}
+		if op.Status == StatusAcknowledged || op.Status == StatusCanceled {
+			continue
+		}
+		dep := r.state.Operations[op.DependsOn]
+		if dep != nil && dep.Status == StatusAcknowledged {
+			continue
+		}
+		entry := UnresolvedDependency{
+			OperationID:  op.ID,
+			OriginClient: op.OriginClient,
+			Status:       op.Status,
+			DependsOn:    op.DependsOn,
+			Reason:       op.RejectReason,
+		}
+		if dep != nil {
+			entry.DependencyOf = dep.OriginClient
+			entry.DependencyStatus = dep.Status
+			if entry.Reason == "" {
+				entry.Reason = "dependency " + string(dep.Status)
+			}
+		} else if entry.Reason == "" {
+			entry.Reason = "missing dependency"
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+// PendingReviewItem describes work a user must look at after a prerequisite
+// was rejected, revised, or abandoned.
+type PendingReviewItem struct {
+	ID           string `json:"id"`
+	OriginClient string `json:"origin_client"`
+	Status       Status `json:"status"`
+	DependsOn    string `json:"depends_on"`
+	Reason       string `json:"reason"`
+}
+
+// PendingReview returns rejected operations (to revise or abandon) followed
+// by the successors that are blocked on them and must not be committed on a
+// stale premise. Independent operations are excluded.
+func (r *Runtime) PendingReview() []PendingReviewItem {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := append([]string(nil), r.state.Order...)
+	sort.Strings(ids)
+	var result []PendingReviewItem
+	for _, id := range ids {
+		op := r.state.Operations[id]
+		if op == nil {
+			continue
+		}
+		switch op.Status {
+		case StatusRejected, StatusBlocked:
+			result = append(result, PendingReviewItem{
+				ID:           op.ID,
+				OriginClient: op.OriginClient,
+				Status:       op.Status,
+				DependsOn:    op.DependsOn,
+				Reason:       op.RejectReason,
+			})
+		}
+	}
+	return result
+}
+
+// DependentsOf returns the transitive successors of an operation. After a
+// prerequisite is rejected, revised, or abandoned, these are exactly the
+// operations that have to be re-reviewed before they can be committed again.
+func (r *Runtime) DependentsOf(predecessorID string) []Operation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := append([]string(nil), r.state.Order...)
+	sort.Strings(ids)
+	children := map[string][]string{}
+	for _, id := range ids {
+		op := r.state.Operations[id]
+		if op != nil && op.DependsOn != "" {
+			children[op.DependsOn] = append(children[op.DependsOn], id)
+		}
+	}
+	var result []Operation
+	seen := map[string]bool{}
+	queue := append([]string(nil), children[predecessorID]...)
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if op := r.state.Operations[id]; op != nil {
+			result = append(result, *op)
+		}
+		queue = append(queue, children[id]...)
+	}
+	return result
+}
+
+const qualifiedSeparator = "/"
+
+func qualifyID(origin, id string) string {
+	if origin == "" || strings.Contains(id, qualifiedSeparator) {
+		return id
+	}
+	return origin + qualifiedSeparator + id
+}
+
+// Snapshot exports this client's operations for exchange with another client.
+// Identities are qualified with the originating client so two clients can
+// reuse the same local id without colliding; provenance is preserved.
+func (r *Runtime) Snapshot() []Operation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := append([]string(nil), r.state.Order...)
+	sort.Strings(ids)
+	result := make([]Operation, 0, len(ids))
+	for _, id := range ids {
+		op := r.state.Operations[id]
+		if op == nil {
+			continue
+		}
+		copied := *op
+		origin := op.OriginClient
+		if origin == "" {
+			origin = r.clientID
+		}
+		copied.OriginClient = origin
+		copied.ID = qualifyID(origin, op.ID)
+		if op.DependsOn != "" {
+			copied.DependsOn = qualifyID(origin, op.DependsOn)
+		}
+		if op.Revises != "" {
+			copied.Revises = qualifyID(origin, op.Revises)
+		}
+		if op.UndoOf != "" {
+			copied.UndoOf = qualifyID(origin, op.UndoOf)
+		}
+		result = append(result, copied)
+	}
+	return result
+}
+
+// statusRank orders how converged knowledge progresses. Terminal outcomes
+// outrank in-flight states, which outrank pending work.
+func statusRank(s Status) int {
+	switch s {
+	case StatusPending:
+		return 1
+	case StatusSending, StatusCancelPending:
+		return 2
+	case StatusBlocked:
+		return 3
+	case StatusRejected:
+		return 4
+	case StatusAcknowledged:
+		return 5
+	case StatusCanceled:
+		return 6
+	case StatusCancelDenied:
+		return 7
+	default:
+		return 0
+	}
+}
+
+// Sync merges another client's operation group into the saved state. Merging
+// is order-independent: syncing A then B and B then A converges to the same
+// state, and exchanging snapshots repeatedly is idempotent. Foreign
+// operations keep their identity and origin and are never submitted by this
+// client; this client only submits its own operations.
+func (r *Runtime) Sync(incoming []Operation) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	changed := false
+	for _, in := range incoming {
+		op := in
+		if op.OriginClient == "" {
+			return ErrDependencyMissing
+		}
+		op.ID = qualifyID(op.OriginClient, in.ID)
+		if op.DependsOn != "" {
+			op.DependsOn = qualifyID(op.OriginClient, in.DependsOn)
+		}
+		if op.Revises != "" {
+			op.Revises = qualifyID(op.OriginClient, in.Revises)
+		}
+		if op.UndoOf != "" {
+			op.UndoOf = qualifyID(op.OriginClient, in.UndoOf)
+		}
+		existing := r.state.Operations[op.ID]
+		if existing == nil {
+			stored := op
+			r.state.Operations[op.ID] = &stored
+			r.state.Order = append(r.state.Order, op.ID)
+			changed = true
+			continue
+		}
+		if statusRank(op.Status) > statusRank(existing.Status) {
+			existing.Status = op.Status
+			if op.RejectReason != "" {
+				existing.RejectReason = op.RejectReason
+			}
+			changed = true
+		}
+		if op.Attempts > existing.Attempts {
+			existing.Attempts = op.Attempts
+		}
+		if existing.OriginClient == "" {
+			existing.OriginClient = op.OriginClient
+		}
+		if op.Kind != "" {
+			existing.Kind = op.Kind
+		}
+		if op.Payload != "" {
+			existing.Payload = op.Payload
+		}
+		if op.ObjectID != "" {
+			existing.ObjectID = op.ObjectID
+		}
+		if op.Revises != "" {
+			existing.Revises = op.Revises
+		}
+		if op.UndoOf != "" {
+			existing.UndoOf = op.UndoOf
+		}
+	}
+	if changed {
+		r.refreshBlocked()
+		return r.store.Save(r.state)
+	}
+	return nil
+}
+
+// refreshBlocked recomputes blocked successors based on current dependency
+// statuses, including dependencies learned through a later sync. A blocked
+// successor whose prerequisite is now acknowledged becomes sendable again
+// only when it belongs to this client; foreign operations stay recorded.
+func (r *Runtime) refreshBlocked() {
+	for {
+		changed := false
+		for _, op := range r.state.Operations {
+			if op.DependsOn == "" {
+				continue
+			}
+			dep := r.state.Operations[op.DependsOn]
+			switch {
+			case dep == nil:
+				if op.Status != StatusBlocked {
+					op.Status = StatusBlocked
+					op.RejectReason = "missing dependency"
+					changed = true
+				}
+			case dep.Status == StatusAcknowledged:
+				if op.Status == StatusBlocked {
+					// Explicit re-confirmation is still required for rejected
+					// premises; missing-dependency entries created by partial
+					// sync can resume automatically once knowledge arrives.
+					if op.RejectReason == "missing dependency" {
+						op.Status = StatusPending
+						op.RejectReason = ""
+						changed = true
+					}
+				}
+			case dep.Status == StatusRejected, dep.Status == StatusBlocked, dep.Status == StatusCanceled:
+				if op.Status != StatusBlocked && op.Status != StatusAcknowledged && op.Status != StatusCanceled {
+					op.Status = StatusBlocked
+					op.RejectReason = "dependency " + string(dep.Status)
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return
+		}
+	}
 }

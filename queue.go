@@ -22,19 +22,21 @@ const (
 )
 
 var (
-	ErrAlreadyExists     = errors.New("operation already exists")
-	ErrNotFound          = errors.New("operation not found")
-	ErrDependencyMissing = errors.New("dependency is missing")
-	ErrDependencyCycle   = errors.New("dependency cycle")
-	ErrNotCancelable     = errors.New("operation is not waiting to be sent")
-	ErrAlreadyCommitted  = errors.New("operation was already committed by the server")
-	ErrNotRejected       = errors.New("operation is not in rejected state")
-	ErrNotCommitted      = errors.New("operation was not committed by the server")
-	ErrNotBlocked        = errors.New("operation is not blocked")
+	ErrAlreadyExists        = errors.New("operation already exists")
+	ErrNotFound             = errors.New("operation not found")
+	ErrDependencyMissing    = errors.New("dependency is missing")
+	ErrDependencyCycle      = errors.New("dependency cycle")
+	ErrNotCancelable        = errors.New("operation is not waiting to be sent")
+	ErrAlreadyCommitted     = errors.New("operation was already committed by the server")
+	ErrNotRejected          = errors.New("operation is not in rejected state")
+	ErrNotCommitted         = errors.New("operation was not committed by the server")
+	ErrNotBlocked           = errors.New("operation is not blocked")
+	ErrDependencyUnresolved = errors.New("dependency is not acknowledged")
 )
 
 type Operation struct {
 	ID           string `json:"id"`
+	OriginClient string `json:"origin_client,omitempty"`
 	Kind         string `json:"kind"`
 	Payload      string `json:"payload"`
 	ObjectID     string `json:"object_id,omitempty"`
