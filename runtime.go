@@ -346,3 +346,20 @@ func (r *Runtime) Status(id string) (Operation, bool) {
 	}
 	return *op, true
 }
+
+// Unresolved lists operations that are blocked on a failed or canceled
+// dependency and therefore need manual review before they can be
+// resubmitted. The result is stable across restarts because it is derived
+// from the persisted state. Unrelated operations are never included.
+func (r *Runtime) Unresolved() []Operation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []Operation
+	for _, id := range r.state.Order {
+		op := r.state.Operations[id]
+		if op.Status == StatusBlocked {
+			result = append(result, *op)
+		}
+	}
+	return result
+}

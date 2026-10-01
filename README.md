@@ -15,6 +15,7 @@
 - 被拒操作可 `Revise` 生成带新身份与 `Revises` 来源的修订重新提交，或 `Abandon` 放弃；旧记录不被覆盖。
 - 后继操作在前置被拒后保持 `blocked`，必须 `ConfirmSuccessor` 显式确认新前提才会重发，不会自动沿用旧前提。
 - 已生效操作的撤销通过 `UndoCommitted` 生成独立的 `undo:*` 业务操作（记录 `UndoOf` 来源），原操作保持已确认。
+- `Unresolved` 列出所有因前置失败而被阻断、需要人工重审的操作（含依赖与原因），重启后从保存状态恢复同一清单，可据此 `Revise`/`ConfirmSuccessor` 继续处理；无关操作不受影响。
 
 运行验证：
 

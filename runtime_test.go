@@ -156,6 +156,78 @@ func mustStore(t *testing.T, dir, clientID string) *FileStore {
 	return store
 }
 
+func TestUnresolvedDependenciesVisibleAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	service := NewMockService()
+	rt, err := NewRuntime("client-r", mustStore(t, dir, "client-r"), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rt.Add("r1", "demo", "root", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rt.Add("r2", "demo", "child", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rt.Add("r3", "demo", "grandchild", "r2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rt.Add("r4", "demo", "unrelated", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	service.Reject["r1"] = "manual review failed"
+	if err := rt.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	unresolved := rt.Unresolved()
+	if len(unresolved) != 2 || unresolved[0].ID != "r2" || unresolved[1].ID != "r3" {
+		t.Fatalf("unresolved = %#v, want r2 and r3", unresolved)
+	}
+	if unresolved[0].DependsOn != "r1" || unresolved[0].RejectReason == "" {
+		t.Fatalf("unresolved entry lost dependency context: %#v", unresolved[0])
+	}
+	if got, _ := rt.Status("r4"); got.Status != StatusAcknowledged {
+		t.Fatalf("unrelated op affected: %#v", got)
+	}
+
+	// Restart: the same unresolved list is recovered from saved state.
+	rt, err = NewRuntime("client-r", mustStore(t, dir, "client-r"), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Unresolved(); len(got) != 2 || got[0].ID != "r2" || got[1].ID != "r3" {
+		t.Fatalf("unresolved after restart = %#v", got)
+	}
+
+	// Continue from saved state: revise the root, re-confirm the chain.
+	if _, err := rt.Revise("r1", "r1-v2", "root-fixed", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.ConfirmSuccessor("r2", "r1-v2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Unresolved(); len(got) != 1 || got[0].ID != "r3" {
+		t.Fatalf("unresolved after partial fix = %#v, want r3", got)
+	}
+	if err := rt.ConfirmSuccessor("r3", "r2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Unresolved(); len(got) != 0 {
+		t.Fatalf("unresolved after full fix = %#v, want none", got)
+	}
+	if got, _ := rt.Status("r3"); got.Status != StatusAcknowledged {
+		t.Fatalf("r3 = %#v, want acknowledged", got)
+	}
+}
+
 func TestStalePreconditionRevisionKeepsIdentityAndProvenance(t *testing.T) {
 	dir := t.TempDir()
 	service := NewMockService()
