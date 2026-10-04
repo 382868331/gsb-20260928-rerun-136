@@ -25,12 +25,14 @@ var (
 	ErrAlreadyExists     = errors.New("operation already exists")
 	ErrNotFound          = errors.New("operation not found")
 	ErrDependencyMissing = errors.New("dependency is missing")
+	ErrDependencyGap     = errors.New("dependency was deleted by history compaction")
 	ErrDependencyCycle   = errors.New("dependency cycle")
 	ErrNotCancelable     = errors.New("operation is not waiting to be sent")
 	ErrAlreadyCommitted  = errors.New("operation was already committed by the server")
 	ErrNotRejected       = errors.New("operation is not in rejected state")
 	ErrNotCommitted      = errors.New("operation was not committed by the server")
 	ErrNotBlocked        = errors.New("operation is not blocked")
+	ErrPlanNotPreview    = errors.New("compaction plan is not a withdrawable preview")
 )
 
 type Operation struct {
@@ -51,10 +53,27 @@ type State struct {
 	ClientID   string                `json:"client_id"`
 	Order      []string              `json:"order"`
 	Operations map[string]*Operation `json:"operations"`
+
+	// Archived holds compacted summaries of acknowledged operations that
+	// are no longer referenced by waiting work. Gaps records operations
+	// deleted by compaction (mapped to the adopting plan id) so late
+	// submissions referencing them become an explainable, processable
+	// gap instead of a silent miss. Plans keeps every compaction
+	// candidate, including adopted ones with the scope they used.
+	Archived map[string]*ArchivedRecord `json:"archived,omitempty"`
+	Gaps     map[string]string          `json:"gaps,omitempty"`
+	Plans    map[string]*CompactionPlan `json:"plans,omitempty"`
+	NextPlan int                        `json:"next_plan,omitempty"`
 }
 
 func newState(clientID string) *State {
-	return &State{ClientID: clientID, Operations: make(map[string]*Operation)}
+	return &State{
+		ClientID:   clientID,
+		Operations: make(map[string]*Operation),
+		Archived:   make(map[string]*ArchivedRecord),
+		Gaps:       make(map[string]string),
+		Plans:      make(map[string]*CompactionPlan),
+	}
 }
 
 type FileStore struct {

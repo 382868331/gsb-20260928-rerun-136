@@ -33,9 +33,11 @@ func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, er
 
 func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
-	if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
+	depErr := r.validateDependency(op.ID, op.DependsOn)
+	gap := errors.Is(depErr, ErrDependencyGap)
+	if depErr != nil && !gap {
 		r.mu.Unlock()
-		return nil, false, err
+		return nil, false, depErr
 	}
 	if existing := r.state.Operations[op.ID]; existing != nil {
 		copied := *existing
@@ -45,6 +47,16 @@ func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	op.Status = StatusPending
 	op.RejectReason = ""
 	op.Attempts = 0
+	if gap {
+		// The dependency was deleted by history compaction and there is
+		// not enough information to reattach automatically. Leave a
+		// processable gap: the operation stays blocked until someone
+		// confirms a new basis with ConfirmSuccessor. Old effects are
+		// never re-executed to fill the gap.
+		op.Status = StatusBlocked
+		op.RejectReason = "dependency deleted by compaction " + r.state.Gaps[op.DependsOn] +
+			"; confirm a new basis with ConfirmSuccessor"
+	}
 	stored := op
 	r.state.Operations[op.ID] = &stored
 	r.state.Order = append(r.state.Order, op.ID)
@@ -170,9 +182,6 @@ func (r *Runtime) validateDependency(id, dependsOn string) error {
 	if dependsOn == id {
 		return ErrDependencyCycle
 	}
-	if _, ok := r.state.Operations[dependsOn]; !ok {
-		return ErrDependencyMissing
-	}
 	seen := map[string]bool{id: true}
 	current := dependsOn
 	for current != "" {
@@ -182,6 +191,17 @@ func (r *Runtime) validateDependency(id, dependsOn string) error {
 		seen[current] = true
 		dep := r.state.Operations[current]
 		if dep == nil {
+			if rec := r.state.Archived[current]; rec != nil {
+				// A confirmed archived fact still releases dependents;
+				// the chain verifiably ends here.
+				if rec.Status == StatusAcknowledged {
+					return nil
+				}
+				return ErrDependencyGap
+			}
+			if _, ok := r.state.Gaps[current]; ok {
+				return ErrDependencyGap
+			}
 			return ErrDependencyMissing
 		}
 		current = dep.DependsOn
@@ -291,8 +311,17 @@ func (r *Runtime) nextSendable() *Operation {
 		dep := r.state.Operations[op.DependsOn]
 		switch {
 		case dep == nil:
+			if rec := r.state.Archived[op.DependsOn]; rec != nil && rec.Status == StatusAcknowledged {
+				// The confirmed fact was compacted to a summary; it
+				// still releases this successor.
+				return op
+			}
 			op.Status = StatusBlocked
-			op.RejectReason = "missing dependency"
+			if planID, ok := r.state.Gaps[op.DependsOn]; ok {
+				op.RejectReason = "dependency gap from " + planID
+			} else {
+				op.RejectReason = "missing dependency"
+			}
 		case dep.Status == StatusAcknowledged:
 			return op
 		case dep.Status == StatusRejected, dep.Status == StatusBlocked, dep.Status == StatusCanceled:
