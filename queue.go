@@ -51,6 +51,9 @@ type State struct {
 	ClientID   string                `json:"client_id"`
 	Order      []string              `json:"order"`
 	Operations map[string]*Operation `json:"operations"`
+	Archive    []ArchivedSummary     `json:"archive,omitempty"`
+	Plans      []*ConsolidationPlan  `json:"plans,omitempty"`
+	PlanSeq    int                   `json:"plan_seq,omitempty"`
 }
 
 func newState(clientID string) *State {

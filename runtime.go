@@ -171,6 +171,12 @@ func (r *Runtime) validateDependency(id, dependsOn string) error {
 		return ErrDependencyCycle
 	}
 	if _, ok := r.state.Operations[dependsOn]; !ok {
+		// Late submissions may reference facts that were already
+		// consolidated into the archive; they can still join their
+		// original dependency chain.
+		if _, archived := r.state.archived(dependsOn); archived {
+			return nil
+		}
 		return ErrDependencyMissing
 	}
 	seen := map[string]bool{id: true}
@@ -291,8 +297,16 @@ func (r *Runtime) nextSendable() *Operation {
 		dep := r.state.Operations[op.DependsOn]
 		switch {
 		case dep == nil:
-			op.Status = StatusBlocked
-			op.RejectReason = "missing dependency"
+			if summary, archived := r.state.archived(op.DependsOn); archived {
+				if summary.Status == StatusAcknowledged && !summary.Corrected {
+					return op
+				}
+				op.Status = StatusBlocked
+				op.RejectReason = "dependency archived as " + string(summary.Status)
+			} else {
+				op.Status = StatusBlocked
+				op.RejectReason = "missing dependency"
+			}
 		case dep.Status == StatusAcknowledged:
 			return op
 		case dep.Status == StatusRejected, dep.Status == StatusBlocked, dep.Status == StatusCanceled:

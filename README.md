@@ -16,6 +16,10 @@
 - 后继操作在前置被拒后保持 `blocked`，必须 `ConfirmSuccessor` 显式确认新前提才会重发，不会自动沿用旧前提。
 - 已生效操作的撤销通过 `UndoCommitted` 生成独立的 `undo:*` 业务操作（记录 `UndoOf` 来源），原操作保持已确认。
 - `Unresolved` 列出所有因前置失败而被阻断、需要人工重审的操作（含依赖与原因），重启后从保存状态恢复同一清单，可据此 `Revise`/`ConfirmSuccessor` 继续处理；无关操作不受影响。
+- `PreviewConsolidation` 生成可预览的历史整理候选：已确认且仍被等待任务引用的记录标记为 `keep_referenced`，已终结但需保留链条可解释性的标记为 `summary_only`，已取消且无引用无争议的标记为 `deletable`；在途（效果未知）与仍有争议的记录一律 `protected`，绝不按年龄直接清除。
+- 候选可 `WithdrawConsolidation` 撤回（仅限未采用前）；`AdoptConsolidation` 采用后删除可删记录、把仅需摘要的记录移入归档，并保留候选及其所依据的范围供审计。整理从不重新执行旧效果来填补历史，独立任务照常放行。
+- 整理期间客户端可补交旧操作：依赖已归档为已确认的事实时仍能接续原依赖链；依赖归档为取消/被拒或资料不足时，操作进入 `blocked` 成为可处理的缺口（出现在 `Unresolved` 中，可 `ConfirmSuccessor` 重指前提）。
+- `CorrectArchived` 处理对已归档结果的迟到更正：摘要标记更正、仍存活的依赖者转为阻断缺口，已终结后继的放行依据保持原记录可解释。
 
 运行验证：
 
