@@ -45,6 +45,12 @@ type Operation struct {
 	Status       Status `json:"status"`
 	Attempts     int    `json:"attempts"`
 	RejectReason string `json:"reject_reason,omitempty"`
+	// MissingPremise records the original predecessor a late submission
+	// depended on when that premise was already removed by consolidation.
+	// The intent of the operation itself is preserved; PremisePlan names
+	// the adopted consolidation scope that removed the premise.
+	MissingPremise string `json:"missing_premise,omitempty"`
+	PremisePlan    string `json:"premise_plan,omitempty"`
 }
 
 type State struct {

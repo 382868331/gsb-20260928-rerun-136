@@ -33,9 +33,10 @@ func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, er
 
 func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
-	if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
+	missingPremise, premisePlan, depErr := r.classifyPremise(op.ID, op.DependsOn)
+	if depErr != nil {
 		r.mu.Unlock()
-		return nil, false, err
+		return nil, false, depErr
 	}
 	if existing := r.state.Operations[op.ID]; existing != nil {
 		copied := *existing
@@ -45,6 +46,21 @@ func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	op.Status = StatusPending
 	op.RejectReason = ""
 	op.Attempts = 0
+	op.MissingPremise = ""
+	op.PremisePlan = ""
+	if missingPremise != "" {
+		// The premise was already removed (or archived as a non-fact) by a
+		// known consolidation. Preserve the late submission's intent as a
+		// processable gap instead of rejecting it outright.
+		op.Status = StatusBlocked
+		op.MissingPremise = missingPremise
+		op.PremisePlan = premisePlan
+		if summary, ok := r.state.archived(missingPremise); ok {
+			op.RejectReason = "premise " + missingPremise + " archived as " + string(summary.Status)
+		} else {
+			op.RejectReason = "premise " + missingPremise + " removed by consolidation " + premisePlan
+		}
+	}
 	stored := op
 	r.state.Operations[op.ID] = &stored
 	r.state.Order = append(r.state.Order, op.ID)
@@ -127,6 +143,8 @@ func (r *Runtime) ConfirmSuccessor(successorID, newDependsOn string) error {
 	op.DependsOn = newDependsOn
 	op.Status = StatusPending
 	op.RejectReason = ""
+	op.MissingPremise = ""
+	op.PremisePlan = ""
 	return r.store.Save(r.state)
 }
 
@@ -170,29 +188,46 @@ func (r *Runtime) validateDependency(id, dependsOn string) error {
 	if dependsOn == id {
 		return ErrDependencyCycle
 	}
-	if _, ok := r.state.Operations[dependsOn]; !ok {
-		// Late submissions may reference facts that were already
-		// consolidated into the archive; they can still join their
-		// original dependency chain.
-		if _, archived := r.state.archived(dependsOn); archived {
-			return nil
-		}
-		return ErrDependencyMissing
+	_, _, err := r.classifyPremise(id, dependsOn)
+	return err
+}
+
+// classifyPremise validates a dependency and, when the premise is no
+// longer a live confirmed fact, returns the missing premise ID together
+// with the consolidation scope (plan ID) responsible for it. The caller
+// then keeps the operation as a blocked, explainable gap rather than
+// dropping it. An archived acknowledged and uncorrected fact still
+// supports late operations and returns no missing premise.
+func (r *Runtime) classifyPremise(id, dependsOn string) (string, string, error) {
+	if dependsOn == "" {
+		return "", "", nil
+	}
+	if dependsOn == id {
+		return "", "", ErrDependencyCycle
 	}
 	seen := map[string]bool{id: true}
 	current := dependsOn
 	for current != "" {
 		if seen[current] {
-			return ErrDependencyCycle
+			return "", "", ErrDependencyCycle
 		}
 		seen[current] = true
-		dep := r.state.Operations[current]
-		if dep == nil {
-			return ErrDependencyMissing
+		if dep := r.state.Operations[current]; dep != nil {
+			current = dep.DependsOn
+			continue
 		}
-		current = dep.DependsOn
+		if summary, ok := r.state.archived(current); ok {
+			if summary.Status == StatusAcknowledged && !summary.Corrected {
+				return "", "", nil
+			}
+			return current, "", nil
+		}
+		if plan := r.state.adoptedRemovalPlan(current); plan != nil {
+			return current, plan.ID, nil
+		}
+		return "", "", ErrDependencyMissing
 	}
-	return nil
+	return "", "", nil
 }
 
 func (r *Runtime) CancelUnsent(id string) error {
@@ -244,6 +279,11 @@ func (r *Runtime) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for {
+		if changed := r.resolveWaitingStates(); changed {
+			if err := r.store.Save(r.state); err != nil {
+				return err
+			}
+		}
 		next := r.nextSendable()
 		if next == nil {
 			return nil
@@ -301,21 +341,63 @@ func (r *Runtime) nextSendable() *Operation {
 				if summary.Status == StatusAcknowledged && !summary.Corrected {
 					return op
 				}
-				op.Status = StatusBlocked
-				op.RejectReason = "dependency archived as " + string(summary.Status)
+				r.markGap(op, op.DependsOn, "premise "+op.DependsOn+
+					" archived as "+string(summary.Status)+" by consolidation")
+			} else if plan := r.state.adoptedRemovalPlan(op.DependsOn); plan != nil {
+				r.markGap(op, op.DependsOn, "premise "+op.DependsOn+
+					" removed by consolidation "+plan.ID)
 			} else {
-				op.Status = StatusBlocked
-				op.RejectReason = "missing dependency"
+				r.markGap(op, op.DependsOn, "missing dependency "+op.DependsOn)
 			}
 		case dep.Status == StatusAcknowledged:
 			return op
 		case dep.Status == StatusRejected, dep.Status == StatusBlocked, dep.Status == StatusCanceled:
+			if op.MissingPremise == "" {
+				op.RejectReason = "dependency " + string(dep.Status)
+			}
 			op.Status = StatusBlocked
-			op.RejectReason = "dependency " + string(dep.Status)
 		default:
 		}
 	}
 	return nil
+}
+
+// markGap turns an operation into a processable blocked gap, recording
+// the missing premise and the consolidation scope that removed it.
+func (r *Runtime) markGap(op *Operation, premise, reason string) {
+	op.Status = StatusBlocked
+	op.RejectReason = reason
+	if op.MissingPremise == "" {
+		op.MissingPremise = premise
+	}
+	if op.PremisePlan == "" {
+		if plan := r.state.adoptedRemovalPlan(premise); plan != nil {
+			op.PremisePlan = plan.ID
+		} else if plan := r.state.adoptedPlanFor(premise, ClassSummaryOnly); plan != nil {
+			op.PremisePlan = plan.ID
+		}
+	}
+}
+
+// resolveWaitingStates re-evaluates pending operations whose premises are
+// live but already failed, so gaps become visible in Unresolved even
+// without calling Add against a missing premise. Blocked operations are
+// never auto-resolved.
+func (r *Runtime) resolveWaitingStates() bool {
+	changed := false
+	for _, id := range r.state.Order {
+		op := r.state.Operations[id]
+		if op == nil || op.Status != StatusPending || op.DependsOn == "" {
+			continue
+		}
+		dep := r.state.Operations[op.DependsOn]
+		if dep != nil && (dep.Status == StatusRejected || dep.Status == StatusBlocked || dep.Status == StatusCanceled) {
+			op.Status = StatusBlocked
+			op.RejectReason = "dependency " + string(dep.Status)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (r *Runtime) MarkRejected(id, reason string) error {

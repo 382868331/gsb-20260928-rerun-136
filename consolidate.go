@@ -39,7 +39,18 @@ type ConsolidationEntry struct {
 	Class        ConsolidationClass `json:"class"`
 	Reason       string             `json:"reason"`
 	ReferencedBy []string           `json:"referenced_by,omitempty"`
+	// Outcome records what actually happened at adoption. Records that
+	// gained dependencies, became disputed, or entered an unknown-effect
+	// state between preview and adoption are kept instead of cleaned.
+	Outcome       string `json:"outcome,omitempty"`
+	OutcomeReason string `json:"outcome_reason,omitempty"`
 }
+
+const (
+	outcomeDeleted  = "deleted"
+	outcomeArchived = "archived"
+	outcomeKept     = "kept"
+)
 
 // ConsolidationPlan is a previewable history-consolidation candidate.
 // It can be withdrawn any time before adoption; once adopted the plan
@@ -68,6 +79,28 @@ type ArchivedSummary struct {
 
 func isTerminal(s Status) bool {
 	return s == StatusAcknowledged || s == StatusCanceled
+}
+
+// cleanupObjection returns a non-empty reason when a record classified
+// deletable or summary-only at preview time must be kept at adoption:
+// its effect has since become unknown, it became disputed, or a waiting
+// task started depending on it between preview and adoption.
+func (r *Runtime) cleanupObjection(op *Operation, referencedBy []string) string {
+	switch op.Status {
+	case StatusSending, StatusCancelPending:
+		return "effect now unknown: operation entered flight after preview"
+	case StatusPending:
+		return "operation still waiting to be sent at adoption"
+	case StatusRejected, StatusBlocked, StatusCancelDenied:
+		return "record became disputed after preview (" + string(op.Status) + ")"
+	}
+	for _, from := range referencedBy {
+		dep := r.state.Operations[from]
+		if dep != nil && !isTerminal(dep.Status) {
+			return "new dependency from waiting task " + from + " appeared after preview"
+		}
+	}
+	return ""
 }
 
 // referencedBy maps each operation ID to the IDs of operations that point
@@ -195,15 +228,28 @@ func (r *Runtime) AdoptConsolidation(planID string) error {
 	if plan.Withdrawn {
 		return ErrPlanWithdrawn
 	}
+	refs := r.state.referencedBy()
 	remove := map[string]bool{}
-	for _, entry := range plan.Entries {
+	for i := range plan.Entries {
+		entry := &plan.Entries[i]
 		op := r.state.Operations[entry.ID]
 		if op == nil {
+			entry.Outcome = outcomeKept
+			entry.OutcomeReason = "record no longer present at adoption"
 			continue
+		}
+		if entry.Class == ClassDeletable || entry.Class == ClassSummaryOnly {
+			if reason := r.cleanupObjection(op, refs[entry.ID]); reason != "" {
+				entry.Outcome = outcomeKept
+				entry.OutcomeReason = reason
+				continue
+			}
 		}
 		switch entry.Class {
 		case ClassDeletable:
 			remove[entry.ID] = true
+			entry.Outcome = outcomeDeleted
+			entry.OutcomeReason = "removed at adoption"
 		case ClassSummaryOnly:
 			r.state.Archive = append(r.state.Archive, ArchivedSummary{
 				ID:           op.ID,
@@ -216,6 +262,11 @@ func (r *Runtime) AdoptConsolidation(planID string) error {
 				RejectReason: op.RejectReason,
 			})
 			remove[entry.ID] = true
+			entry.Outcome = outcomeArchived
+			entry.OutcomeReason = "summary archived at adoption"
+		default:
+			entry.Outcome = outcomeKept
+			entry.OutcomeReason = "protected by preview"
 		}
 	}
 	if len(remove) > 0 {
@@ -263,6 +314,41 @@ func (s *State) archived(id string) (*ArchivedSummary, bool) {
 		}
 	}
 	return nil, false
+}
+
+// adoptedRemovalPlan returns the adopted plan that removed id, i.e. a
+// deletable record that is neither live nor archived. Withdrawn plans and
+// plans that ultimately kept the record never qualify.
+func (s *State) adoptedRemovalPlan(id string) *ConsolidationPlan {
+	for i := len(s.Plans) - 1; i >= 0; i-- {
+		plan := s.Plans[i]
+		if !plan.Adopted || plan.Withdrawn {
+			continue
+		}
+		for _, entry := range plan.Entries {
+			if entry.ID == id && entry.Class == ClassDeletable &&
+				(entry.Outcome == "" || entry.Outcome == outcomeDeleted) {
+				return plan
+			}
+		}
+	}
+	return nil
+}
+
+// adoptedPlanFor finds the adopted plan that classified id with class.
+func (s *State) adoptedPlanFor(id string, class ConsolidationClass) *ConsolidationPlan {
+	for i := len(s.Plans) - 1; i >= 0; i-- {
+		plan := s.Plans[i]
+		if !plan.Adopted || plan.Withdrawn {
+			continue
+		}
+		for _, entry := range plan.Entries {
+			if entry.ID == id && entry.Class == class {
+				return plan
+			}
+		}
+	}
+	return nil
 }
 
 // CorrectArchived applies a late correction to a previously consolidated
