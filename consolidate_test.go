@@ -237,3 +237,159 @@ func TestLateCorrectionCreatesProcessableGap(t *testing.T) {
 		t.Fatalf("late-2 after gap resolution = %s", op.Status)
 	}
 }
+
+func TestLateSubmissionOnDeletedRecordBecomesProcessableGap(t *testing.T) {
+	rt, service, dir := setupHistory(t)
+	plan, err := rt.PreviewConsolidation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.AdoptConsolidation(plan.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rt.Status("h3"); ok {
+		t.Fatal("h3 should be deleted by consolidation")
+	}
+
+	// Late resubmission depending on the deleted record is kept as a
+	// blocked gap, not rejected at the door.
+	gap, created, err := rt.Add("late-del", "demo", "original-intent", "h3")
+	if err != nil {
+		t.Fatalf("late add on deleted dep: %v", err)
+	}
+	if !created || gap.Status != StatusBlocked {
+		t.Fatalf("late-del = %#v, want blocked gap", gap)
+	}
+	if gap.MissingPremise != "h3" || gap.ConsolidationScope != plan.ID {
+		t.Fatalf("gap markers = (%q, %q), want (h3, %s)",
+			gap.MissingPremise, gap.ConsolidationScope, plan.ID)
+	}
+	if gap.Payload != "original-intent" {
+		t.Fatalf("gap lost original intent: %#v", gap)
+	}
+
+	// Duplicate resubmission returns the same record, never a second one.
+	again, created, err := rt.Add("late-del", "demo", "changed", "h3")
+	if err != nil || created {
+		t.Fatalf("duplicate late add = (%v, %v), want (false, nil)", created, err)
+	}
+	if again.Payload != "original-intent" {
+		t.Fatalf("duplicate add overwrote intent: %#v", again)
+	}
+
+	// The gap is visible in the unresolved list and survives a restart.
+	found := false
+	for _, op := range rt.Unresolved() {
+		if op.ID == "late-del" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unresolved = %v, want late-del listed", rt.Unresolved())
+	}
+	restarted, err := NewRuntime("c", mustStore(t, dir, "c"), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, op := range restarted.Unresolved() {
+		if op.ID == "late-del" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unresolved after restart = %#v, want late-del listed", restarted.Unresolved())
+	}
+
+	// Flushing never re-executes the deleted record to fill the gap.
+	effectsBefore := service.EffectCount()
+	if err := restarted.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.EffectCount(); got != effectsBefore+1 {
+		t.Fatalf("effects = %d, want %d (only independent h7)", got, effectsBefore+1)
+	}
+	if op, _ := restarted.Status("late-del"); op.Status != StatusBlocked {
+		t.Fatalf("late-del after flush = %#v, want still blocked", op)
+	}
+
+	// The user confirms a new valid premise, then the gap sends.
+	if _, _, err := restarted.Add("fix", "demo", "fixed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ConfirmSuccessor("late-del", "fix"); err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate confirmation does not apply twice.
+	if err := restarted.ConfirmSuccessor("late-del", "fix"); !errors.Is(err, ErrNotBlocked) {
+		t.Fatalf("duplicate confirm = %v, want ErrNotBlocked", err)
+	}
+	if err := restarted.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	op, _ := restarted.Status("late-del")
+	if op.Status != StatusAcknowledged || op.MissingPremise != "" || op.ConsolidationScope != "" {
+		t.Fatalf("late-del after resolution = %#v", op)
+	}
+	count := 0
+	for _, e := range service.EffectsSnapshot() {
+		if e.ID == "late-del" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("late-del applied %d times, want 1", count)
+	}
+}
+
+func TestAdoptionRechecksDependenciesAddedAfterPreview(t *testing.T) {
+	rt, _, _ := setupHistory(t)
+	// An unrelated canceled record is deletable and stays so.
+	if _, _, err := rt.Add("h9", "demo", "p-h9", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.CancelUnsent("h9"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := rt.PreviewConsolidation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := entryClass(t, plan, "h3"); got != ClassDeletable {
+		t.Fatalf("h3 class = %s, want deletable", got)
+	}
+	// Between preview and adoption a new waiting task starts depending
+	// on the deletable record, and a summary-only record becomes
+	// disputed. Neither may be cleaned by the stale candidate.
+	if _, _, err := rt.Add("h8", "demo", "p-h8", "h3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.MarkRejected("h2", "late dispute"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.AdoptConsolidation(plan.ID); err != nil {
+		t.Fatal(err)
+	}
+	if op, ok := rt.Status("h3"); !ok || op.Status != StatusCanceled {
+		t.Fatalf("h3 must be kept for new dependent, got %#v", op)
+	}
+	if op, ok := rt.Status("h2"); !ok || op.Status != StatusRejected {
+		t.Fatalf("h2 must be kept as disputed, got %#v", op)
+	}
+	// h1 is now referenced by the disputed h2, so it is kept as well.
+	if _, ok := rt.Status("h1"); !ok {
+		t.Fatal("h1 must be kept while its dependent h2 is disputed")
+	}
+	// The unaffected deletable record added before adoption is cleaned.
+	if _, ok := rt.Status("h9"); ok {
+		t.Fatal("h9 should be deleted by adoption")
+	}
+	// The confirmed summary still supports the late dependent chain:
+	// h8 was blocked on canceled h3 and stays a processable gap.
+	if op, _ := rt.Status("h8"); op.Status != StatusBlocked {
+		t.Fatalf("h8 = %#v, want blocked on canceled h3", op)
+	}
+}

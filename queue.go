@@ -45,6 +45,13 @@ type Operation struct {
 	Status       Status `json:"status"`
 	Attempts     int    `json:"attempts"`
 	RejectReason string `json:"reject_reason,omitempty"`
+	// MissingPremise marks a dependency that is gone from local history
+	// (e.g. removed by an adopted consolidation), so the operation is
+	// kept as a processable gap instead of being rejected at the door.
+	MissingPremise string `json:"missing_premise,omitempty"`
+	// ConsolidationScope identifies the adopted consolidation plan whose
+	// scope removed MissingPremise, so the gap stays explainable.
+	ConsolidationScope string `json:"consolidation_scope,omitempty"`
 }
 
 type State struct {

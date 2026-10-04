@@ -33,18 +33,45 @@ func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, er
 
 func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
-	if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
+	missingPremise := ""
+	if op.DependsOn != "" {
+		if _, ok := r.state.Operations[op.DependsOn]; !ok {
+			if _, archived := r.state.archived(op.DependsOn); !archived {
+				missingPremise = op.DependsOn
+			}
+		}
+	}
+	if missingPremise == "" {
+		if err := r.validateDependency(op.ID, op.DependsOn); err != nil {
+			r.mu.Unlock()
+			return nil, false, err
+		}
+	} else if op.DependsOn == op.ID {
 		r.mu.Unlock()
-		return nil, false, err
+		return nil, false, ErrDependencyCycle
 	}
 	if existing := r.state.Operations[op.ID]; existing != nil {
 		copied := *existing
 		r.mu.Unlock()
 		return &copied, false, nil
 	}
-	op.Status = StatusPending
 	op.RejectReason = ""
 	op.Attempts = 0
+	if missingPremise != "" {
+		// Late resubmission whose premise was removed from history
+		// (e.g. deleted by an adopted consolidation). Keep the original
+		// intent as a blocked, processable gap instead of failing the
+		// submission; the user confirms a new premise before it sends.
+		op.Status = StatusBlocked
+		op.MissingPremise = missingPremise
+		op.ConsolidationScope = r.state.consolidationScopeOf(missingPremise)
+		op.RejectReason = "missing dependency " + missingPremise
+		if op.ConsolidationScope != "" {
+			op.RejectReason += " (removed by " + op.ConsolidationScope + ")"
+		}
+	} else {
+		op.Status = StatusPending
+	}
 	stored := op
 	r.state.Operations[op.ID] = &stored
 	r.state.Order = append(r.state.Order, op.ID)
@@ -127,6 +154,8 @@ func (r *Runtime) ConfirmSuccessor(successorID, newDependsOn string) error {
 	op.DependsOn = newDependsOn
 	op.Status = StatusPending
 	op.RejectReason = ""
+	op.MissingPremise = ""
+	op.ConsolidationScope = ""
 	return r.store.Save(r.state)
 }
 
@@ -306,6 +335,8 @@ func (r *Runtime) nextSendable() *Operation {
 			} else {
 				op.Status = StatusBlocked
 				op.RejectReason = "missing dependency"
+				op.MissingPremise = op.DependsOn
+				op.ConsolidationScope = r.state.consolidationScopeOf(op.DependsOn)
 			}
 		case dep.Status == StatusAcknowledged:
 			return op

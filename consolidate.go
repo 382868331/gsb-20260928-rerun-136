@@ -104,40 +104,7 @@ func (r *Runtime) PreviewConsolidation() (*ConsolidationPlan, error) {
 		if op == nil {
 			continue
 		}
-		entry := ConsolidationEntry{ID: id, ReferencedBy: refs[id]}
-		switch {
-		case op.Status == StatusSending || op.Status == StatusCancelPending:
-			entry.Class = ClassProtected
-			entry.Reason = "effect unknown: operation is in flight"
-		case op.Status == StatusPending:
-			entry.Class = ClassProtected
-			entry.Reason = "operation is still waiting to be sent"
-		case op.Status == StatusRejected || op.Status == StatusBlocked || op.Status == StatusCancelDenied:
-			entry.Class = ClassProtected
-			entry.Reason = "record is still disputed or awaiting review (" + string(op.Status) + ")"
-		case isTerminal(op.Status):
-			waiting := false
-			for _, from := range refs[id] {
-				if dep := r.state.Operations[from]; dep != nil && !isTerminal(dep.Status) {
-					waiting = true
-					break
-				}
-			}
-			switch {
-			case waiting:
-				entry.Class = ClassKeepReferenced
-				entry.Reason = "confirmed fact still referenced by waiting tasks"
-			case op.Status == StatusAcknowledged:
-				entry.Class = ClassSummaryOnly
-				entry.Reason = "confirmed fact; summary kept for chain explainability"
-			case len(refs[id]) > 0:
-				entry.Class = ClassSummaryOnly
-				entry.Reason = "referenced by finished records; summary kept"
-			default:
-				entry.Class = ClassDeletable
-				entry.Reason = "canceled, unreferenced and undisputed"
-			}
-		}
+		entry := classifyRecord(op, refs, r.state)
 		plan.Entries = append(plan.Entries, entry)
 		plan.Scope = append(plan.Scope, id)
 	}
@@ -149,6 +116,65 @@ func (r *Runtime) PreviewConsolidation() (*ConsolidationPlan, error) {
 	}
 	copied := *plan
 	return &copied, nil
+}
+
+// classifyRecord derives the consolidation class of one record from the
+// current state. It is shared by preview and adoption so a plan is always
+// re-validated against the live history before anything is removed.
+func classifyRecord(op *Operation, refs map[string][]string, s *State) ConsolidationEntry {
+	entry := ConsolidationEntry{ID: op.ID, ReferencedBy: refs[op.ID]}
+	switch {
+	case op.Status == StatusSending || op.Status == StatusCancelPending:
+		entry.Class = ClassProtected
+		entry.Reason = "effect unknown: operation is in flight"
+	case op.Status == StatusPending:
+		entry.Class = ClassProtected
+		entry.Reason = "operation is still waiting to be sent"
+	case op.Status == StatusRejected || op.Status == StatusBlocked || op.Status == StatusCancelDenied:
+		entry.Class = ClassProtected
+		entry.Reason = "record is still disputed or awaiting review (" + string(op.Status) + ")"
+	case isTerminal(op.Status):
+		waiting := false
+		for _, from := range refs[op.ID] {
+			if dep := s.Operations[from]; dep != nil && !isTerminal(dep.Status) {
+				waiting = true
+				break
+			}
+		}
+		switch {
+		case waiting:
+			entry.Class = ClassKeepReferenced
+			entry.Reason = "confirmed fact still referenced by waiting tasks"
+		case op.Status == StatusAcknowledged:
+			entry.Class = ClassSummaryOnly
+			entry.Reason = "confirmed fact; summary kept for chain explainability"
+		case len(refs[op.ID]) > 0:
+			entry.Class = ClassSummaryOnly
+			entry.Reason = "referenced by finished records; summary kept"
+		default:
+			entry.Class = ClassDeletable
+			entry.Reason = "canceled, unreferenced and undisputed"
+		}
+	}
+	return entry
+}
+
+// consolidationScopeOf returns the ID of the most recent adopted
+// consolidation plan whose scope covered the given record, or "" if the
+// record was never part of an adopted consolidation.
+func (s *State) consolidationScopeOf(id string) string {
+	for i := len(s.Plans) - 1; i >= 0; i-- {
+		plan := s.Plans[i]
+		if !plan.Adopted {
+			continue
+		}
+		for _, scoped := range plan.Scope {
+			if scoped == id {
+				return plan.ID
+			}
+		}
+	}
+	return ""
 }
 
 func (r *Runtime) findPlan(planID string) *ConsolidationPlan {
@@ -195,10 +221,18 @@ func (r *Runtime) AdoptConsolidation(planID string) error {
 	if plan.Withdrawn {
 		return ErrPlanWithdrawn
 	}
+	// Re-validate every entry against the live history: dependencies,
+	// disputes, or in-flight states that appeared after the preview must
+	// not be cleaned. Only records whose current classification still
+	// matches the candidate are touched; everything else is kept.
+	refs := r.state.referencedBy()
 	remove := map[string]bool{}
 	for _, entry := range plan.Entries {
 		op := r.state.Operations[entry.ID]
 		if op == nil {
+			continue
+		}
+		if current := classifyRecord(op, refs, r.state); current.Class != entry.Class {
 			continue
 		}
 		switch entry.Class {
