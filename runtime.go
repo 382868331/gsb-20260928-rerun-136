@@ -33,6 +33,12 @@ func (r *Runtime) Add(id, kind, payload, dependsOn string) (*Operation, bool, er
 
 func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 	r.mu.Lock()
+	// An archived summary keeps its identity: a new record may not reuse
+	// the same ID and silently replace the confirmed summary as a premise.
+	if _, archived := r.state.archived(op.ID); archived {
+		r.mu.Unlock()
+		return nil, false, ErrArchivedIdentity
+	}
 	missingPremise := ""
 	if op.DependsOn != "" {
 		if _, ok := r.state.Operations[op.DependsOn]; !ok {

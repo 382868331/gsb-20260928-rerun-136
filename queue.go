@@ -31,6 +31,9 @@ var (
 	ErrNotRejected       = errors.New("operation is not in rejected state")
 	ErrNotCommitted      = errors.New("operation was not committed by the server")
 	ErrNotBlocked        = errors.New("operation is not blocked")
+	ErrArchivedIdentity  = errors.New("operation id is retained by an archived summary")
+	ErrRevisionNotFound  = errors.New("dependency revision plan not found")
+	ErrRevisionConflict  = errors.New("assignment is not in the plan valid set")
 )
 
 type Operation struct {
@@ -55,12 +58,14 @@ type Operation struct {
 }
 
 type State struct {
-	ClientID   string                `json:"client_id"`
-	Order      []string              `json:"order"`
-	Operations map[string]*Operation `json:"operations"`
-	Archive    []ArchivedSummary     `json:"archive,omitempty"`
-	Plans      []*ConsolidationPlan  `json:"plans,omitempty"`
-	PlanSeq    int                   `json:"plan_seq,omitempty"`
+	ClientID    string                    `json:"client_id"`
+	Order       []string                  `json:"order"`
+	Operations  map[string]*Operation     `json:"operations"`
+	Archive     []ArchivedSummary         `json:"archive,omitempty"`
+	Plans       []*ConsolidationPlan      `json:"plans,omitempty"`
+	PlanSeq     int                       `json:"plan_seq,omitempty"`
+	Revisions   []*DependencyRevisionPlan `json:"revisions,omitempty"`
+	RevisionSeq int                       `json:"revision_seq,omitempty"`
 }
 
 func newState(clientID string) *State {

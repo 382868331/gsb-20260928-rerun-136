@@ -56,6 +56,18 @@ func (s *MockService) Submit(op Operation) error {
 	return nil
 }
 
+// Verify reports whether the operation's effect is already applied
+// remotely, so an in-flight operation is never re-executed blindly.
+func (s *MockService) Verify(opID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Offline {
+		return false, ErrRemoteUnavailable
+	}
+	_, applied := s.applied[opID]
+	return applied, nil
+}
+
 func (s *MockService) Cancel(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
