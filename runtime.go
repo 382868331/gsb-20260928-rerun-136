@@ -2,7 +2,6 @@ package offlinequeue
 
 import (
 	"errors"
-	"sort"
 	"sync"
 )
 
@@ -54,6 +53,12 @@ func (r *Runtime) AddOp(op Operation) (*Operation, bool, error) {
 		copied := *existing
 		r.mu.Unlock()
 		return &copied, false, nil
+	}
+	if _, archived := r.state.archived(op.ID); archived {
+		// A confirmed summary stays a legal premise, but its identity
+		// must not be taken over by a new same-named record.
+		r.mu.Unlock()
+		return nil, false, ErrArchivedIdentity
 	}
 	op.RejectReason = ""
 	op.Attempts = 0
@@ -273,65 +278,106 @@ func (r *Runtime) Flush() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for {
-		next := r.nextSendable()
-		if next == nil {
+		ready := r.readyOpsLocked()
+		if len(ready) == 0 {
 			return nil
 		}
-		next.Status = StatusSending
-		if err := r.store.Save(r.state); err != nil {
-			return err
-		}
-		next.Attempts++
-		err := r.remote.Submit(*next)
-		if err != nil {
-			if errors.Is(err, ErrAcknowledgementLost) {
-				next.Status = StatusPending
-				if saveErr := r.store.Save(r.state); saveErr != nil {
-					return saveErr
-				}
-				continue
-			}
-			if errors.Is(err, ErrRejectedByService) {
-				next.Status = StatusRejected
-				next.RejectReason = err.Error()
-				r.blockDependents(next.ID)
-				if saveErr := r.store.Save(r.state); saveErr != nil {
-					return saveErr
-				}
-				continue
-			}
-			if saveErr := r.store.Save(r.state); saveErr != nil {
-				return saveErr
-			}
-			return err
-		}
-		next.Status = StatusAcknowledged
-		if err := r.store.Save(r.state); err != nil {
+		if err := r.submitLocked(ready[0]); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *Runtime) nextSendable() *Operation {
-	ids := append([]string(nil), r.state.Order...)
-	sort.Strings(ids)
-	for _, id := range ids {
+// FlushFair submits ready operations in rounds of at most slots
+// concurrent executions. Ready operations are served in submission order,
+// so every ready branch progresses within a bounded number of rounds.
+// Operations whose premise is still unknown never occupy a slot: they are
+// skipped (or marked blocked with an accurate reason) instead of stalling
+// independent branches. Operations with a known effect (acknowledged,
+// rejected, canceled) are never resubmitted, and an in-flight operation
+// is only ever retried, never duplicated under a new identity.
+func (r *Runtime) FlushFair(slots int) error {
+	if slots < 1 {
+		slots = 1
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for {
+		ready := r.readyOpsLocked()
+		if len(ready) == 0 {
+			return nil
+		}
+		if len(ready) > slots {
+			ready = ready[:slots]
+		}
+		for _, next := range ready {
+			if err := r.submitLocked(next); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// submitLocked persists and submits one ready operation. Lost
+// acknowledgements and business rejections are handled locally (the
+// operation returns to pending or is rejected and its dependents are
+// blocked); any other error is returned to the caller with the operation
+// kept in sending state so a restart can retry it.
+func (r *Runtime) submitLocked(next *Operation) error {
+	next.Status = StatusSending
+	if err := r.store.Save(r.state); err != nil {
+		return err
+	}
+	next.Attempts++
+	err := r.remote.Submit(*next)
+	if err != nil {
+		if errors.Is(err, ErrAcknowledgementLost) {
+			next.Status = StatusPending
+			return r.store.Save(r.state)
+		}
+		if errors.Is(err, ErrRejectedByService) {
+			next.Status = StatusRejected
+			next.RejectReason = err.Error()
+			r.blockDependents(next.ID)
+			return r.store.Save(r.state)
+		}
+		if saveErr := r.store.Save(r.state); saveErr != nil {
+			return saveErr
+		}
+		return err
+	}
+	next.Status = StatusAcknowledged
+	return r.store.Save(r.state)
+}
+
+// readyOpsLocked returns every operation that can be submitted right now,
+// in submission order. Operations waiting on an unresolved premise are
+// skipped without consuming execution capacity; operations whose premise
+// has failed or vanished are marked blocked with an accurate reason.
+func (r *Runtime) readyOpsLocked() []*Operation {
+	var ready []*Operation
+	for _, id := range r.state.Order {
 		op := r.state.Operations[id]
+		if op == nil {
+			continue
+		}
 		if op.Status != StatusPending && op.Status != StatusSending {
 			continue
 		}
 		if op.DependsOn == "" {
-			return op
+			ready = append(ready, op)
+			continue
 		}
 		dep := r.state.Operations[op.DependsOn]
 		switch {
 		case dep == nil:
 			if summary, archived := r.state.archived(op.DependsOn); archived {
 				if summary.Status == StatusAcknowledged && !summary.Corrected {
-					return op
+					ready = append(ready, op)
+				} else {
+					op.Status = StatusBlocked
+					op.RejectReason = "dependency archived as " + string(summary.Status)
 				}
-				op.Status = StatusBlocked
-				op.RejectReason = "dependency archived as " + string(summary.Status)
 			} else {
 				op.Status = StatusBlocked
 				op.RejectReason = "missing dependency"
@@ -339,14 +385,14 @@ func (r *Runtime) nextSendable() *Operation {
 				op.ConsolidationScope = r.state.consolidationScopeOf(op.DependsOn)
 			}
 		case dep.Status == StatusAcknowledged:
-			return op
+			ready = append(ready, op)
 		case dep.Status == StatusRejected, dep.Status == StatusBlocked, dep.Status == StatusCanceled:
 			op.Status = StatusBlocked
 			op.RejectReason = "dependency " + string(dep.Status)
 		default:
 		}
 	}
-	return nil
+	return ready
 }
 
 func (r *Runtime) MarkRejected(id, reason string) error {

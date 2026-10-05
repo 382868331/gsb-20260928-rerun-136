@@ -31,6 +31,10 @@ var (
 	ErrNotRejected       = errors.New("operation is not in rejected state")
 	ErrNotCommitted      = errors.New("operation was not committed by the server")
 	ErrNotBlocked        = errors.New("operation is not blocked")
+	// ErrArchivedIdentity rejects a new operation whose ID is already used
+	// by an archived summary: a confirmed summary stays a valid premise,
+	// but its identity must never be replaced by a same-named new record.
+	ErrArchivedIdentity = errors.New("operation id conflicts with an archived summary")
 )
 
 type Operation struct {
@@ -55,12 +59,14 @@ type Operation struct {
 }
 
 type State struct {
-	ClientID   string                `json:"client_id"`
-	Order      []string              `json:"order"`
-	Operations map[string]*Operation `json:"operations"`
-	Archive    []ArchivedSummary     `json:"archive,omitempty"`
-	Plans      []*ConsolidationPlan  `json:"plans,omitempty"`
-	PlanSeq    int                   `json:"plan_seq,omitempty"`
+	ClientID    string                `json:"client_id"`
+	Order       []string              `json:"order"`
+	Operations  map[string]*Operation `json:"operations"`
+	Archive     []ArchivedSummary     `json:"archive,omitempty"`
+	Plans       []*ConsolidationPlan  `json:"plans,omitempty"`
+	PlanSeq     int                   `json:"plan_seq,omitempty"`
+	RebindPlans []*RebindPlan         `json:"rebind_plans,omitempty"`
+	RebindSeq   int                   `json:"rebind_seq,omitempty"`
 }
 
 func newState(clientID string) *State {
